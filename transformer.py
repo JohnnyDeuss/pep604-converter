@@ -1,5 +1,7 @@
 import ast
-from typing import Final
+from typing import Final, Literal
+
+RemovedTyping = Literal["Union", "Optional"]
 
 
 class Transformer(ast.NodeTransformer):
@@ -8,16 +10,38 @@ class Transformer(ast.NodeTransformer):
     `Optional[X]` with `X | None`.
     """
 
-    deprecated_types: Final[set[str]] = {"Union", "Optional"}
+    deprecated_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
 
-    def transform(self, source: str, filename: str) -> str:
-        self._lines = source.split("\n")
-        self._lineno = 0
-        self._char_delta = 0
-        self.has_changes = False
-        tree = ast.parse(source, filename=filename, type_comments=True)
-        self.visit(tree)
-        return self._source
+    def transform(self, source: str) -> str:
+        while True:
+            self._lines: list[str] = source.split("\n")
+            self._lineno: int = 0
+            self._char_delta: int = 0
+            self._imports: list[ast.ImportFrom] = []
+            self._keep_imports_for: set[RemovedTyping] = set()
+            self.has_changes: bool = False
+
+            tree = ast.parse(source, filename="<string>", type_comments=True)
+            self.visit(tree)
+            for import_node in self._imports:
+                old_names = import_node.names
+                import_node.names = [
+                    alias
+                    for alias in import_node.names
+                    if alias.name not in self.deprecated_types
+                    or alias.name in self._keep_imports_for
+                ]
+                if len(old_names) != len(import_node.names):
+                    if not import_node.names:
+                        self.substitute(import_node, "")
+                    else:
+                        self.substitute(import_node, ast.unparse(import_node))
+            source = "\n".join(self._lines)
+
+            if not self.has_changes:
+                break
+
+        return source
 
     def substitute(self, node: ast.AST, text: str) -> None:
         self.has_changes = True
@@ -45,15 +69,7 @@ class Transformer(ast.NodeTransformer):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST | None:
         if node.module == "typing":
             if any(alias.name in self.deprecated_types for alias in node.names):
-                node.names = [
-                    alias
-                    for alias in node.names
-                    if alias.name not in self.deprecated_types
-                ]
-                if not node.names:
-                    self.substitute(node, "")
-                    return None
-                self.substitute(node, ast.unparse(node))
+                self._imports.append(node)
                 return node
         return self.generic_visit(node)
 
@@ -64,16 +80,32 @@ class Transformer(ast.NodeTransformer):
             and node.value.id in self.deprecated_types
         ):
             if node.value.id == "Optional":
-                self.substitute(node, f"{ast.unparse(node.slice)} | None")
+                if isinstance(node.slice, ast.Constant):
+                    # Optional["T"].
+                    self._keep_imports_for.add("Optional")
+                else:
+                    # Optional[T].
+                    self.substitute(node, f"{ast.unparse(node.slice)} | None")
                 return node
             elif node.value.id == "Union":
-                self.substitute(
-                    node,
-                    " | ".join([ast.unparse(name) for name in node.slice.elts]),
-                )
+                if isinstance(node.slice, ast.Tuple):
+                    if any(isinstance(elt, ast.Constant) for elt in node.slice.elts):
+                        # Union[X, "Y"]
+                        self._keep_imports_for.add("Union")
+                    else:
+                        # Union[X, Y]
+                        self.substitute(
+                            node,
+                            " | ".join([ast.unparse(name) for name in node.slice.elts]),
+                        )
+                elif isinstance(node.slice, ast.Constant):
+                    # Union["X"].
+                    self._keep_imports_for.add("Union")
+                else:
+                    # Union[X].
+                    self.substitute(
+                        node,
+                        ast.unparse(node.slice),
+                    )
                 return node
         return self.generic_visit(node)
-
-    @property
-    def _source(self) -> str:
-        return "\n".join(self._lines)
