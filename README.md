@@ -2,6 +2,8 @@
 Convert Optionals and Unions in Python code to use pipe syntax, i.e.
 `Optional[X]` to `X | None` and `Union[X, Y]` to `X | Y`.
 
+Run at your own risk and please back up your code before running this script.
+
 # Running
 
 `./main.py <directory with .py files>`
