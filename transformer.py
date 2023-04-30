@@ -1,7 +1,99 @@
 import ast
+import re
+from bisect import bisect
+from dataclasses import dataclass
 from typing import Final, Literal
 
 RemovedTyping = Literal["Union", "Optional"]
+
+
+@dataclass
+class DeleteLine:
+    lineno: int
+
+
+@dataclass
+class Substitution:
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int
+    text: str
+
+
+class ConflictingOperationsException(Exception):
+    def __init__(self, a: Substitution, b: Substitution) -> None:
+        super().__init__(f"Conflicting operations; {a} and {b} overlap")
+
+
+FULL_LINE: Final[int] = -1
+
+
+class Rewriter:
+    """
+    Allow rewriting of text without having to keep track of line numbers
+    and column and without having to perform operations in order.
+    """
+
+    def __init__(self, source: str) -> None:
+        self.source: str = source
+        self.operations: list[Substitution] = []
+
+    @staticmethod
+    def _sort_key(op: Substitution) -> tuple[int, int]:
+        return op.lineno, op.col_offset
+
+    def _check_overlaps(self, a: Substitution, b: Substitution):
+        """
+        Check for overlap between `a` and `b`, where `a` precedes `b in
+        the sort order.
+        """
+        if a.end_lineno > b.lineno:
+            raise ConflictingOperationsException(a, b)
+        elif a.end_lineno == b.lineno and a.end_col_offset > b.col_offset:
+            raise ConflictingOperationsException(a, b)
+
+    def substitute(
+        self,
+        lineno: int,
+        end_lineno: int,
+        col_offset: int,
+        end_col_offset: int,
+        text: str,
+    ):
+        op = Substitution(
+            lineno=lineno,
+            end_lineno=end_lineno,
+            col_offset=col_offset,
+            end_col_offset=end_col_offset,
+            text=text,
+        )
+        idx = bisect(self.operations, self._sort_key(op), key=self._sort_key)
+        if idx > 0:
+            self._check_overlaps(self.operations[idx - 1], op)
+        if idx < len(self.operations):
+            self._check_overlaps(op, self.operations[idx])
+        self.operations.insert(idx, op)
+
+    def get_result(self) -> str:
+        lines = self.source.split("\n")
+        for op in reversed(self.operations):
+            if (
+                not op.text
+                and op.lineno == op.end_lineno
+                and op.col_offset == 0
+                and op.end_col_offset == len(lines[op.lineno - 1])
+            ):
+                del lines[op.lineno - 1]
+            else:
+                lines[op.lineno - 1] = (
+                    lines[op.lineno - 1][: op.col_offset]
+                    + op.text
+                    + lines[op.end_lineno - 1][op.end_col_offset :]
+                )
+                for lineno in range(op.end_lineno, op.lineno, -1):
+                    del lines[lineno - 1]
+        return "\n".join(lines)
 
 
 class Transformer(ast.NodeTransformer):
@@ -14,33 +106,26 @@ class Transformer(ast.NodeTransformer):
 
     def transform(self, source: str) -> str:
         while True:
-            self._lines: list[str] = source.split("\n")
-            # The latest line no processed and the line that `_char_delta` applies to.
-            self._lineno: int = 0
-            # The number of characters nodes on this line will have shifted by.
-            self._char_delta: int = 0
-            # The number of lines that nodes will have moved since parsing.
-            self._line_delta: int = 0
-            # Set of typing imports encountered during the `visit` path that may need to be rewritten.
+            # Set of typing imports encountered during the `visit` path that
+            # may need to be rewritten.
             self._imports: list[ast.ImportFrom] = []
-            # Encounter deprecated types that should not be removed, since a special case was encountered.
+            # Encounter deprecated types that should not be removed, since a
+            # special case was encountered.
             self._keep_imports_for: set[RemovedTyping] = set()
             self._has_changes: bool = False
+            self._rewriter: Rewriter = Rewriter(source)
 
             tree = ast.parse(source, filename="<string>", mode="exec")
             self.visit(tree)
 
             self.rewrite_imports()
-            source = "\n".join(self._lines)
+            source = self._rewriter.get_result()
 
             if not self._has_changes:
                 # Rather than making changes recursively, we're doing
                 # multiple passes until no further changes are made.
                 break
-        while len(self._lines) and not self._lines[0]:
-            del self._lines[0]
-        source = "\n".join(self._lines)
-        return source
+        return re.sub("^\n+", "", source)
 
     def rewrite_imports(self):
         """
@@ -48,9 +133,6 @@ class Transformer(ast.NodeTransformer):
         source is not changed, as some uses of Optional and Union cannot
         be converted.
         """
-        self._lineno = 0
-        self._char_delta = 0
-        self._line_delta = 0
         for import_node in self._imports:
             old_names = import_node.names
             import_node.names = [
@@ -67,46 +149,13 @@ class Transformer(ast.NodeTransformer):
 
     def substitute(self, node: ast.AST, text: str) -> None:
         self._has_changes = True
-        if node.lineno + self._line_delta != self._lineno:
-            self._char_delta = 0
-
-        self._lineno = node.end_lineno + self._line_delta
-        if (
-            not text
-            and node.lineno == node.end_lineno
-            and node.col_offset == 0
-            and node.end_col_offset
-            == len(self._lines[node.lineno - 1 + self._line_delta])
-        ):
-            # Line deletion
-            del self._lines[node.lineno - 1 + self._line_delta]
-            return
-
-        line = self._lines[node.lineno - 1 + self._line_delta]
-        self._lines[node.lineno - 1 + self._line_delta] = (
-            line[: node.col_offset + self._char_delta]
-            + text
-            + self._lines[node.end_lineno - 1 + self._line_delta][
-                node.end_col_offset + self._char_delta :
-            ]
+        self._rewriter.substitute(
+            node.lineno, node.end_lineno, node.col_offset, node.end_col_offset, text
         )
-        if node.lineno == node.end_lineno:
-            # Inline edit
-            delta = len(text) - (node.end_col_offset - node.col_offset)
-            self._char_delta += delta
-        else:
-            # Multi-line edit
-            self._char_delta = node.col_offset + len(text) - node.end_lineno
-            self._lineno = node.lineno + self._line_delta
-            for lineno in range(node.end_lineno, node.lineno, -1):
-                del self._lines[lineno - 1 + self._line_delta]
-            self._line_delta -= node.end_lineno - node.lineno
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST | None:
         if node.module == "typing":
             if any(alias.name in self.deprecated_types for alias in node.names):
-                node.lineno += self._line_delta
-                node.end_lineno += self._line_delta
                 self._imports.append(node)
                 return node
         return self.generic_visit(node)
