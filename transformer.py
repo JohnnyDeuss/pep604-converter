@@ -106,26 +106,34 @@ class Transformer(ast.NodeTransformer):
     rewritable_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
 
     def transform(self, source: str) -> str:
+        # List of typing imports encountered during the `visit` pass
+        # that may need to be rewritten.
+        self._import_froms: set[ast.ImportFrom] = set()
+        self._imports: set[ast.Import] = set()
+        # Whether an attribute was accessed on typing that was not
+        # one of the replaceable, meaning the import can't be
+        # removed.
+        self._other_attrs_encountered = False
+        # Keeps track of types that were used in such a way that it
+        # couldn't be rewritten, meaning we can't remove the import.
+        self._keep_imports_for: set[RemovedTyping] = set()
+        self._first_pass = True
         while True:
-            # List of typing imports encountered during the `visit` pass
-            # that may need to be rewritten.
-            self._imports: list[ast.ImportFrom] = []
-            # Keeps track of types that were used in such a way that it
-            # couldn't be rewritten, meaning we can't remove the import.
-            self._keep_imports_for: set[RemovedTyping] = set()
             self._has_changes: bool = False
             self._rewriter: Rewriter = Rewriter(source)
 
             tree = ast.parse(source, filename="<string>", mode="exec")
             self.visit(tree)
 
-            self.rewrite_imports()
             source = self._rewriter.get_result()
+            self._first_pass = False
 
             if not self._has_changes:
                 # Rather than making changes recursively, we're doing
                 # multiple passes until no further changes can be made.
                 break
+        self.rewrite_imports()
+        source = self._rewriter.get_result()
         return re.sub("^\n+", "", source)
 
     def rewrite_imports(self):
@@ -134,19 +142,28 @@ class Transformer(ast.NodeTransformer):
         for imports, the source is not changed until the entire file has
         been processed.
         """
-        for import_node in self._imports:
-            old_names = import_node.names
-            import_node.names = [
-                alias
-                for alias in import_node.names
-                if alias.name not in self.rewritable_types
-                or alias.name in self._keep_imports_for
-            ]
-            if len(old_names) != len(import_node.names):
+        if not self._other_attrs_encountered:
+            for import_node in self._imports:
+                import_node.names = [
+                    alias for alias in import_node.names if alias.name != "typing"
+                ]
                 if not import_node.names:
                     self.substitute(import_node, "")
                 else:
                     self.substitute(import_node, ast.unparse(import_node))
+        for import_from_node in self._import_froms:
+            old_names = import_from_node.names
+            import_from_node.names = [
+                alias
+                for alias in import_from_node.names
+                if alias.name not in self.rewritable_types
+                or alias.name in self._keep_imports_for
+            ]
+            if len(old_names) != len(import_from_node.names):
+                if not import_from_node.names:
+                    self.substitute(import_from_node, "")
+                else:
+                    self.substitute(import_from_node, ast.unparse(import_from_node))
 
     def substitute(self, node: ast.AST, text: str) -> None:
         self._has_changes = True
@@ -154,47 +171,76 @@ class Transformer(ast.NodeTransformer):
             node.lineno, node.end_lineno, node.col_offset, node.end_col_offset, text
         )
 
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST | None:
+    def visit_Import(self, node: ast.Import) -> ast.AST:
+        if not self._first_pass:
+            return node
+        if any(name.name == "typing" for name in node.names):
+            self._imports.add(node)
+            return node
+        return self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
+        if not self._first_pass:
+            return node
         if node.module == "typing":
             if any(alias.name in self.rewritable_types for alias in node.names):
-                self._imports.append(node)
+                self._import_froms.add(node)
                 return node
         return self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript):
-        if (
-            isinstance(node.ctx, ast.Load)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in self.rewritable_types
-        ):
-            if node.value.id == "Optional":
-                if isinstance(node.slice, ast.Constant):
-                    # Optional["T"].
-                    self._keep_imports_for.add("Optional")
-                else:
-                    # Optional[T].
-                    self.substitute(node, f"{ast.unparse(node.slice)} | None")
-                    return node
-            elif node.value.id == "Union":
-                if isinstance(node.slice, ast.Tuple):
-                    if any(isinstance(elt, ast.Constant) for elt in node.slice.elts):
-                        # Union[X, "Y"]
+        if isinstance(node.ctx, ast.Load):
+            lhs = ""
+            if isinstance(node.value, ast.Name):
+                lhs = node.value.id
+            elif (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "typing"
+            ):
+                lhs = node.value.attr
+            if lhs and lhs in self.rewritable_types:
+                if lhs == "Optional":
+                    if isinstance(node.slice, ast.Constant):
+                        # Optional["T"].
+                        self._keep_imports_for.add("Optional")
+                    else:
+                        # Optional[T].
+                        self.substitute(node, f"{ast.unparse(node.slice)} | None")
+                        return node
+                elif lhs == "Union":
+                    if isinstance(node.slice, ast.Tuple):
+                        if any(
+                            isinstance(elt, ast.Constant) for elt in node.slice.elts
+                        ):
+                            # Union[X, "Y"]
+                            self._keep_imports_for.add("Union")
+                        else:
+                            # Union[X, Y]
+                            self.substitute(
+                                node,
+                                " | ".join(
+                                    [ast.unparse(name) for name in node.slice.elts]
+                                ),
+                            )
+                            return node
+                    elif isinstance(node.slice, ast.Constant):
+                        # Union["X"].
                         self._keep_imports_for.add("Union")
                     else:
-                        # Union[X, Y]
+                        # Union[X].
                         self.substitute(
                             node,
-                            " | ".join([ast.unparse(name) for name in node.slice.elts]),
+                            ast.unparse(node.slice),
                         )
                         return node
-                elif isinstance(node.slice, ast.Constant):
-                    # Union["X"].
-                    self._keep_imports_for.add("Union")
-                else:
-                    # Union[X].
-                    self.substitute(
-                        node,
-                        ast.unparse(node.slice),
-                    )
-                    return node
+        return self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "typing"
+            and node.attr not in self.rewritable_types
+        ):
+            self._other_attrs_encountered = True
         return self.generic_visit(node)
