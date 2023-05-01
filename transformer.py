@@ -5,7 +5,7 @@ from bisect import bisect
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Final, Literal
 
 RemovedTyping = Literal["Union", "Optional"]
 
@@ -107,6 +107,13 @@ class Transformer(ast.NodeTransformer):
     """
 
     rewritable_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
+    # Nodes types that do not need to be processed further, i.e. need
+    # no recursion or unparsing.
+    as_is_node_types: Final[tuple[type[ast.AST], ...]] = (
+        ast.Constant,
+        ast.Name,
+        ast.Attribute,
+    )
 
     def __init__(self, source: str, node: ast.AST | None = None) -> None:
         super().__init__()
@@ -197,8 +204,11 @@ class Transformer(ast.NodeTransformer):
                         self._keep_imports_for.add("Optional")
                     else:
                         # Optional[T].
-                        with self.sub_transformer(node.slice) as sub_transformer:
-                            sub_str = sub_transformer.transform()
+                        if isinstance(node.slice, self.as_is_node_types):
+                            sub_str = ast.get_source_segment(self._source, node.slice)
+                        else:
+                            with self.sub_transformer(node.slice) as sub_transformer:
+                                sub_str = sub_transformer.transform()
                         self.substitute(node, f"{sub_str} | None")
                         return node
                 elif lhs == "Union":
@@ -212,8 +222,13 @@ class Transformer(ast.NodeTransformer):
                             # Union[X, Y]
                             sub_strs: list[str] = []
                             for name in node.slice.elts:
-                                with self.sub_transformer(name) as sub_transformer:
-                                    sub_strs.append(sub_transformer.transform())
+                                if isinstance(node.slice, self.as_is_node_types):
+                                    sub_strs.append(
+                                        ast.get_source_segment(self._source, name)
+                                    )
+                                else:
+                                    with self.sub_transformer(name) as sub_transformer:
+                                        sub_strs.append(sub_transformer.transform())
                             self.substitute(node, " | ".join(sub_strs))
                             return node
                     elif isinstance(node.slice, ast.Constant):
@@ -223,7 +238,7 @@ class Transformer(ast.NodeTransformer):
                         # Union[X].
                         self.substitute(
                             node,
-                            ast.unparse(node.slice),
+                            ast.get_source_segment(self._source, node.slice),
                         )
                         return node
         return self.generic_visit(node)
