@@ -1,8 +1,11 @@
 import ast
+import copy
 import re
 from bisect import bisect
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 RemovedTyping = Literal["Union", "Optional"]
 
@@ -105,7 +108,8 @@ class Transformer(ast.NodeTransformer):
 
     rewritable_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
 
-    def transform(self, source: str) -> str:
+    def __init__(self, source: str, node: ast.AST | None = None) -> None:
+        super().__init__()
         # List of typing imports encountered during the `visit` pass
         # that may need to be rewritten.
         self._import_froms: set[ast.ImportFrom] = set()
@@ -117,21 +121,12 @@ class Transformer(ast.NodeTransformer):
         # Keeps track of types that were used in such a way that it
         # couldn't be rewritten, meaning we can't remove the import.
         self._keep_imports_for: set[RemovedTyping] = set()
-        self._first_pass = True
-        while True:
-            self._has_changes: bool = False
-            self._rewriter: Rewriter = Rewriter(source)
+        self._source: str = source
+        self._rewriter: Rewriter = Rewriter(source)
+        self.tree = node or ast.parse(source, filename="<string>", mode="exec")
 
-            tree = ast.parse(source, filename="<string>", mode="exec")
-            self.visit(tree)
-
-            source = self._rewriter.get_result()
-            self._first_pass = False
-
-            if not self._has_changes:
-                # Rather than making changes recursively, we're doing
-                # multiple passes until no further changes can be made.
-                break
+    def transform(self) -> str:
+        self.visit(self.tree)
         self.rewrite_imports()
         source = self._rewriter.get_result()
         return re.sub("^\n+", "", source)
@@ -172,16 +167,12 @@ class Transformer(ast.NodeTransformer):
         )
 
     def visit_Import(self, node: ast.Import) -> ast.AST:
-        if not self._first_pass:
-            return node
         if any(name.name == "typing" for name in node.names):
             self._imports.add(node)
             return node
         return self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
-        if not self._first_pass:
-            return node
         if node.module == "typing":
             if any(alias.name in self.rewritable_types for alias in node.names):
                 self._import_froms.add(node)
@@ -206,7 +197,9 @@ class Transformer(ast.NodeTransformer):
                         self._keep_imports_for.add("Optional")
                     else:
                         # Optional[T].
-                        self.substitute(node, f"{ast.unparse(node.slice)} | None")
+                        with self.sub_transformer(node.slice) as sub_transformer:
+                            sub_str = sub_transformer.transform()
+                        self.substitute(node, f"{sub_str} | None")
                         return node
                 elif lhs == "Union":
                     if isinstance(node.slice, ast.Tuple):
@@ -217,12 +210,11 @@ class Transformer(ast.NodeTransformer):
                             self._keep_imports_for.add("Union")
                         else:
                             # Union[X, Y]
-                            self.substitute(
-                                node,
-                                " | ".join(
-                                    [ast.unparse(name) for name in node.slice.elts]
-                                ),
-                            )
+                            sub_strs: list[str] = []
+                            for name in node.slice.elts:
+                                with self.sub_transformer(name) as sub_transformer:
+                                    sub_strs.append(sub_transformer.transform())
+                            self.substitute(node, " | ".join(sub_strs))
                             return node
                     elif isinstance(node.slice, ast.Constant):
                         # Union["X"].
@@ -244,3 +236,40 @@ class Transformer(ast.NodeTransformer):
         ):
             self._other_attrs_encountered = True
         return self.generic_visit(node)
+
+    @contextmanager
+    def sub_transformer(self, node: ast.AST) -> Generator["Transformer", None, None]:
+        sub_tree = copy.deepcopy(node)
+        ast.increment_lineno(sub_tree, -sub_tree.lineno + 1)
+        DedentTransformer().transform(sub_tree)
+        source = ast.get_source_segment(self._source, node)
+        assert source is not None, f"Could not determine source segment for {node}"
+        transformer = Transformer(source, sub_tree)
+        yield transformer
+        self._import_froms.update(transformer._import_froms)
+        self._imports.update(transformer._imports)
+        self._keep_imports_for.update(transformer._keep_imports_for)
+        self._other_attrs_encountered = (
+            self._other_attrs_encountered or transformer._other_attrs_encountered
+        )
+
+
+class DedentTransformer(ast.NodeTransformer):
+    """
+    Transformer to move the col_offset of a node to the start of the
+    line, moving nodes behind it up as well.
+    """
+
+    def transform(self, node: ast.AST) -> None:
+        self._n: int = node.col_offset
+        self._lineno: int = node.lineno
+        self.visit(node)
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        if (lineno := getattr(node, "lineno", None)) and lineno == self._lineno:
+            node.col_offset -= self._n
+        if (
+            end_lineno := getattr(node, "end_lineno", None)
+        ) and end_lineno == self._lineno:
+            node.end_col_offset -= self._n
+        return super().visit(node)
