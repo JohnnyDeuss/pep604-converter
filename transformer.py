@@ -31,8 +31,9 @@ FULL_LINE: Final[int] = -1
 
 class Rewriter:
     """
-    Allow rewriting of text without having to keep track of line numbers
-    and column and without having to perform operations in order.
+    Allow the rewriting of the source file without having to keep track
+    of line and column numbers and without having to perform operations
+    in order.
     """
 
     def __init__(self, source: str) -> None:
@@ -102,15 +103,15 @@ class Transformer(ast.NodeTransformer):
     `Optional[X]` with `X | None`.
     """
 
-    deprecated_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
+    rewritable_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
 
     def transform(self, source: str) -> str:
         while True:
-            # Set of typing imports encountered during the `visit` path that
-            # may need to be rewritten.
+            # List of typing imports encountered during the `visit` pass
+            # that may need to be rewritten.
             self._imports: list[ast.ImportFrom] = []
-            # Encounter deprecated types that should not be removed, since a
-            # special case was encountered.
+            # Keeps track of types that were used in such a way that it
+            # couldn't be rewritten, meaning we can't remove the import.
             self._keep_imports_for: set[RemovedTyping] = set()
             self._has_changes: bool = False
             self._rewriter: Rewriter = Rewriter(source)
@@ -123,22 +124,22 @@ class Transformer(ast.NodeTransformer):
 
             if not self._has_changes:
                 # Rather than making changes recursively, we're doing
-                # multiple passes until no further changes are made.
+                # multiple passes until no further changes can be made.
                 break
         return re.sub("^\n+", "", source)
 
     def rewrite_imports(self):
         """
-        During the `visit` pass, import and usage is collected, but the
-        source is not changed, as some uses of Optional and Union cannot
-        be converted.
+        During the `visit` pass, imports and their uses are tracked, but
+        for imports, the source is not changed until the entire file has
+        been processed.
         """
         for import_node in self._imports:
             old_names = import_node.names
             import_node.names = [
                 alias
                 for alias in import_node.names
-                if alias.name not in self.deprecated_types
+                if alias.name not in self.rewritable_types
                 or alias.name in self._keep_imports_for
             ]
             if len(old_names) != len(import_node.names):
@@ -155,7 +156,7 @@ class Transformer(ast.NodeTransformer):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST | None:
         if node.module == "typing":
-            if any(alias.name in self.deprecated_types for alias in node.names):
+            if any(alias.name in self.rewritable_types for alias in node.names):
                 self._imports.append(node)
                 return node
         return self.generic_visit(node)
@@ -164,7 +165,7 @@ class Transformer(ast.NodeTransformer):
         if (
             isinstance(node.ctx, ast.Load)
             and isinstance(node.value, ast.Name)
-            and node.value.id in self.deprecated_types
+            and node.value.id in self.rewritable_types
         ):
             if node.value.id == "Optional":
                 if isinstance(node.slice, ast.Constant):
