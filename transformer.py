@@ -199,7 +199,9 @@ class Transformer(ast.NodeTransformer):
                 lhs = node.value.attr
             if lhs and lhs in self.rewritable_types:
                 if lhs == "Optional":
-                    if isinstance(node.slice, ast.Constant):
+                    if isinstance(node.slice, ast.Constant) and isinstance(
+                        node.slice.value, str
+                    ):
                         # Optional["T"].
                         self._keep_imports_for.add("Optional")
                     else:
@@ -214,7 +216,8 @@ class Transformer(ast.NodeTransformer):
                 elif lhs == "Union":
                     if isinstance(node.slice, ast.Tuple):
                         if any(
-                            isinstance(elt, ast.Constant) for elt in node.slice.elts
+                            isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                            for elt in node.slice.elts
                         ):
                             # Union[X, "Y"]
                             self._keep_imports_for.add("Union")
