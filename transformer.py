@@ -106,6 +106,7 @@ class Transformer(ast.NodeTransformer):
     `Optional[X]` with `X | None`.
     """
 
+    _parent: ast.AST | None = None
     rewritable_types: Final[set[RemovedTyping]] = {"Union", "Optional"}
     # Nodes types that do not need to be processed further, i.e. need
     # no recursion or unparsing.
@@ -131,6 +132,15 @@ class Transformer(ast.NodeTransformer):
         self._source: str = source
         self._rewriter: Rewriter = Rewriter(source)
         self.tree = node or ast.parse(source, filename="<string>", mode="exec")
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        # Keep track of parent nodes.
+        node.parent = self._parent
+        old_parent = self._parent
+        self._parent = node
+        node = super().visit(node)
+        self._parent = old_parent
+        return node
 
     def transform(self) -> str:
         self.visit(self.tree)
@@ -253,6 +263,19 @@ class Transformer(ast.NodeTransformer):
             and node.attr not in self.rewritable_types
         ):
             self._other_attrs_encountered = True
+        return self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        """
+        Handle any cases where the types are used without subscripting.
+        No assumption is made as to how the type is used and ensure the
+        import remains.
+        """
+        if (
+            node.id in self.rewritable_types
+            and node.parent and not isinstance(node.parent, ast.Subscript)
+        ):
+            self._keep_imports_for.add(node.id)
         return self.generic_visit(node)
 
     @contextmanager
